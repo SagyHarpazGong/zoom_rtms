@@ -29,6 +29,10 @@ audio:
   channels: 1  # Mono
   bit_depth: 16
   encoding: "pcm"
+  # Audio stream mode:
+  # - "mixed": All speakers mixed into one stream (Option 1) - ASR does diarization
+  # - "individual": Separate stream per speaker (Option 2) - Pre-separated speakers
+  stream_mode: "mixed"  # Options: "mixed", "individual"
 
 # Buffering Configuration
 buffering:

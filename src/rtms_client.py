@@ -19,13 +19,15 @@ class RTMSClient:
         client_id: str,
         client_secret: str,
         sample_rate: int = 16000,
-        channels: int = 1
+        channels: int = 1,
+        stream_mode: str = "mixed"
     ):
         self.logger = get_logger(__name__)
         self.client_id = client_id
         self.client_secret = client_secret
         self.sample_rate = sample_rate
         self.channels = channels
+        self.stream_mode = stream_mode
 
         # RTMS client instance
         self.client: Optional[rtms.Client] = None
@@ -44,7 +46,7 @@ class RTMSClient:
         # Track participants
         self.participants: Dict[str, Dict[str, Any]] = {}
 
-        self.logger.info("rtms_client_initialized")
+        self.logger.info("rtms_client_initialized", stream_mode=stream_mode)
 
     def set_audio_callback(self, callback: Callable) -> None:
         """Set callback for incoming audio data
@@ -145,13 +147,19 @@ class RTMSClient:
                 2: rtms.AudioChannel['STEREO']
             }
 
+            # Determine audio data option based on stream mode
+            if self.stream_mode == "individual":
+                audio_data_opt = rtms.AudioDataOption['AUDIO_INDIVIDUAL_STREAMS']
+            else:
+                audio_data_opt = rtms.AudioDataOption['AUDIO_MIXED_STREAM']
+
             # Configure audio parameters
             params = rtms.AudioParams(
                 content_type=rtms.AudioContentType['RAW_AUDIO'],
                 codec=rtms.AudioCodec['PCM'],  # PCM for raw audio
                 sample_rate=sample_rate_map.get(self.sample_rate, rtms.AudioSampleRate['SR_16K']),
                 channel=channel_map.get(self.channels, rtms.AudioChannel['MONO']),
-                data_opt=rtms.AudioDataOption['AUDIO_MIXED_STREAM'],  # Get mixed audio
+                data_opt=audio_data_opt,
                 duration=20,  # 20ms frames
                 frame_size=self.sample_rate * self.channels * 20 // 1000  # Calculate frame size
             )
@@ -161,7 +169,9 @@ class RTMSClient:
             self.logger.info(
                 "audio_params_configured",
                 sample_rate=self.sample_rate,
-                channels=self.channels
+                channels=self.channels,
+                stream_mode=self.stream_mode,
+                data_opt=audio_data_opt
             )
 
         except Exception as e:
@@ -306,13 +316,15 @@ class RTMSWebhookHandler:
         client_id: str,
         client_secret: str,
         port: int = 8080,
-        path: str = '/webhook'
+        path: str = '/webhook',
+        stream_mode: str = "mixed"
     ):
         self.logger = get_logger(__name__)
         self.client_id = client_id
         self.client_secret = client_secret
         self.port = port
         self.path = path
+        self.stream_mode = stream_mode
 
         # Track active clients
         self.clients: Dict[str, RTMSClient] = {}
@@ -366,7 +378,8 @@ class RTMSWebhookHandler:
             # Create RTMS client
             client = RTMSClient(
                 client_id=self.client_id,
-                client_secret=self.client_secret
+                client_secret=self.client_secret,
+                stream_mode=self.stream_mode
             )
 
             # Join the meeting

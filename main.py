@@ -40,12 +40,16 @@ class RTMSTranscriptionSystem:
 
     def _init_clients(self) -> None:
         """Initialize clients"""
+        # Get stream mode from config
+        stream_mode = self.config['audio'].get('stream_mode', 'mixed')
+
         # Zoom RTMS client
         self.rtms_client = RTMSClient(
             client_id=self.config['zoom']['client_id'],
             client_secret=self.config['zoom']['client_secret'],
             sample_rate=self.config['audio']['sample_rate'],
-            channels=self.config['audio']['channels']
+            channels=self.config['audio']['channels'],
+            stream_mode=stream_mode
         )
 
         # VAD client
@@ -63,23 +67,32 @@ class RTMSTranscriptionSystem:
             reconnect_delay=self.config['asr']['reconnect_delay_seconds']
         )
 
-        self.logger.info("clients_initialized")
+        self.logger.info("clients_initialized", stream_mode=stream_mode)
 
     def _init_audio_buffer(self) -> None:
         """Initialize audio buffer manager"""
+        # Determine processing mode from config
+        stream_mode = self.config['audio'].get('stream_mode', 'mixed')
+        per_speaker_processing = (stream_mode == 'individual')
+
         self.audio_buffer = AudioBuffer(
             sample_rate=self.config['audio']['sample_rate'],
             vad_duration_ms=self.config['vad']['packet_duration_ms'],
             asr_duration_seconds=self.config['asr']['segment_duration_seconds'],
             min_speech_duration_ms=self.config['buffering']['min_speech_duration_ms'],
-            silence_timeout_seconds=self.config['buffering']['silence_timeout_seconds']
+            silence_timeout_seconds=self.config['buffering']['silence_timeout_seconds'],
+            per_speaker_processing=per_speaker_processing
         )
 
         # Set callbacks
         self.audio_buffer.set_vad_callback(self._on_vad_packet_ready)
         self.audio_buffer.set_asr_callback(self._on_asr_segment_ready)
 
-        self.logger.info("audio_buffer_initialized")
+        self.logger.info(
+            "audio_buffer_initialized",
+            stream_mode=stream_mode,
+            per_speaker_processing=per_speaker_processing
+        )
 
     def _init_transcription_handler(self) -> None:
         """Initialize transcription handler"""
@@ -210,7 +223,8 @@ class RTMSTranscriptionSystem:
             timestamp: Audio timestamp
         """
         # Add to audio buffer (will trigger VAD processing)
-        await self.audio_buffer.add_audio(audio_data, timestamp)
+        # Pass participant_id for per-speaker processing mode
+        await self.audio_buffer.add_audio(audio_data, timestamp, speaker_id=participant_id)
 
         # Record audio if enabled
         if self.recorder:
@@ -341,12 +355,16 @@ async def start_with_webhook(config: Dict[str, Any]):
     logger = get_logger(__name__)
     logger.info("starting_webhook_mode")
 
+    # Get stream mode from config
+    stream_mode = config['audio'].get('stream_mode', 'mixed')
+
     # Create webhook handler
     webhook_handler = RTMSWebhookHandler(
         client_id=config['zoom']['client_id'],
         client_secret=config['zoom']['client_secret'],
         port=config.get('webhook', {}).get('port', 8080),
-        path=config.get('webhook', {}).get('path', '/webhook')
+        path=config.get('webhook', {}).get('path', '/webhook'),
+        stream_mode=stream_mode
     )
 
     # Track systems by stream ID
