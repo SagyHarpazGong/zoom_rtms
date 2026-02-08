@@ -1,188 +1,131 @@
-"""WebSocket client for Automatic Speech Recognition (ASR) server"""
+"""HTTP client for Automatic Speech Recognition (ASR) via KServe/FastAPI.
 
-import asyncio
-import json
-from typing import Optional, Callable, Dict, Any
-import websockets
-from websockets.exceptions import ConnectionClosed
+Sends audio + contextual prompt to a remote ASR server and returns
+word-level transcription results.
+"""
 
-from .utils import get_logger, numpy_to_pcm
-from .audio_buffer import AudioChunk
+import base64
+from typing import List, Optional
+
+import httpx
+import numpy as np
+from pydantic import BaseModel
+
+from .utils import get_logger
+
+
+logger = get_logger(__name__)
+
+
+class ASRWord(BaseModel):
+    """A single transcribed word with timing."""
+    start: float
+    end: float
+    text: str
+
+
+class ASRSegment(BaseModel):
+    """A transcription segment containing words."""
+    words: List[ASRWord] = []
+    text: str = ""
+    no_speech_prob: float = 0.0
+
+
+class ASRRequest(BaseModel):
+    """Request payload for the ASR server. Adjust when implementing KServe server."""
+    audio_base64: str
+    sample_rate: int = 16000
+    prompt: str = ""
+    recog_sent_history: List[str] = []
+    speaker_id: Optional[str] = None
+
+
+class ASRResponse(BaseModel):
+    """Response from the ASR server. Adjust when implementing KServe server."""
+    segments: List[ASRSegment] = []
 
 
 class ASRClient:
-    """WebSocket client for ASR server
+    """HTTP client for remote ASR inference.
 
-    Sends 2.5s speech segments and receives transcription results.
+    Sends audio + context via POST to a KServe endpoint and returns
+    parsed word-level transcription results.
     """
 
-    def __init__(
-        self,
-        ws_url: str,
-        enable_diarization: bool = True,
-        reconnect_attempts: int = 5,
-        reconnect_delay: int = 2
-    ):
-        self.logger = get_logger(__name__)
-        self.ws_url = ws_url
-        self.enable_diarization = enable_diarization
-        self.reconnect_attempts = reconnect_attempts
-        self.reconnect_delay = reconnect_delay
+    def __init__(self, url: str, timeout_seconds: float = 30.0):
+        self.url = url
+        self.timeout_seconds = timeout_seconds
+        self.http_client: Optional[httpx.AsyncClient] = None
 
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.is_connected = False
-        self.transcription_callback: Optional[Callable] = None
-        self._running = False
-        self._pending_segments = {}  # Track sent segments for matching results
-
-    def set_transcription_callback(self, callback: Callable) -> None:
-        """Set callback for transcription results
-
-        Callback signature: async def callback(transcription: Dict[str, Any], audio_chunk: AudioChunk)
-        """
-        self.transcription_callback = callback
+        logger.info("asr_client_initialized", url=url, timeout=timeout_seconds)
 
     async def connect(self) -> bool:
-        """Connect to ASR WebSocket server
+        """Create the HTTP client session."""
+        self.http_client = httpx.AsyncClient(timeout=self.timeout_seconds)
+        logger.info("asr_client_ready", url=self.url)
+        return True
 
-        Returns:
-            True if connected successfully
-        """
-        for attempt in range(self.reconnect_attempts):
-            try:
-                self.logger.info(
-                    "asr_connecting",
-                    url=self.ws_url,
-                    attempt=attempt + 1
-                )
-
-                self.websocket = await websockets.connect(
-                    self.ws_url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    max_size=10 * 1024 * 1024  # 10MB max message size
-                )
-
-                self.is_connected = True
-                self.logger.info("asr_connected")
-
-                # Start receiving responses
-                asyncio.create_task(self._receive_loop())
-
-                return True
-
-            except Exception as e:
-                self.logger.warning(
-                    "asr_connection_failed",
-                    attempt=attempt + 1,
-                    error=str(e)
-                )
-
-                if attempt < self.reconnect_attempts - 1:
-                    await asyncio.sleep(self.reconnect_delay)
-
-        self.logger.error("asr_connection_failed_all_attempts")
-        return False
-
-    async def _receive_loop(self) -> None:
-        """Continuously receive transcription results"""
-        self._running = True
-
-        try:
-            while self._running and self.websocket:
-                try:
-                    message = await self.websocket.recv()
-
-                    # Parse transcription result
-                    result = json.loads(message) if isinstance(message, str) else message
-
-                    self.logger.info(
-                        "asr_result_received",
-                        text=result.get("text", "")[:50],  # First 50 chars
-                        speaker=result.get("speaker_id"),
-                        audio_id=result.get("audio_id")
-                    )
-
-                    # Match with pending segment
-                    audio_id = result.get("audio_id")
-                    audio_chunk = self._pending_segments.pop(audio_id, None)
-
-                    # Call transcription callback
-                    if self.transcription_callback:
-                        await self.transcription_callback(result, audio_chunk)
-
-                except ConnectionClosed:
-                    self.logger.warning("asr_connection_closed")
-                    self.is_connected = False
-                    # Attempt reconnection
-                    await self.connect()
-                    break
-
-                except Exception as e:
-                    self.logger.error("asr_receive_error", error=str(e))
-
-        except Exception as e:
-            self.logger.error("asr_receive_loop_error", error=str(e))
-        finally:
-            self._running = False
-
-    async def transcribe(self, audio_chunk: AudioChunk) -> None:
-        """Send speech segment to ASR server for transcription
+    async def transcribe(
+        self,
+        audio: np.ndarray,
+        prompt: str = "",
+        recog_sent_history: Optional[List[str]] = None,
+        speaker_id: Optional[str] = None,
+    ) -> ASRResponse:
+        """POST audio + context to ASR server, return parsed response.
 
         Args:
-            audio_chunk: Audio chunk to transcribe (should be ~2.5s)
+            audio: float32 numpy array of audio samples.
+            prompt: Contextual prompt from committed words.
+            recog_sent_history: Recent committed sentences for context.
+            speaker_id: Optional speaker identifier.
+
+        Returns:
+            ASRResponse with word-level transcription segments.
         """
-        if not self.is_connected or not self.websocket:
-            self.logger.warning("asr_not_connected")
-            return
+        if not self.http_client:
+            logger.error("asr_client_not_connected")
+            return ASRResponse()
+
+        request = ASRRequest(
+            audio_base64=base64.b64encode(audio.astype(np.float32).tobytes()).decode(),
+            sample_rate=16000,
+            prompt=prompt,
+            recog_sent_history=recog_sent_history or [],
+            speaker_id=speaker_id,
+        )
 
         try:
-            # Generate unique ID for this segment
-            audio_id = id(audio_chunk)
-            self._pending_segments[audio_id] = audio_chunk
-
-            # Convert numpy array to PCM bytes
-            pcm_data = numpy_to_pcm(audio_chunk.data)
-
-            # Create message payload
-            # Note: Adjust format based on your ASR server's expected format
-            message = {
-                "audio": pcm_data.hex(),  # Hex-encoded audio data
-                "sample_rate": audio_chunk.sample_rate,
-                "timestamp": audio_chunk.timestamp.isoformat(),
-                "audio_id": audio_id,
-                "enable_diarization": self.enable_diarization,
-                "speaker_id": audio_chunk.speaker_id  # If known from context
-            }
-
-            # Send as JSON (or binary depending on server)
-            await self.websocket.send(json.dumps(message))
-
-            duration = len(audio_chunk.data) / audio_chunk.sample_rate
-            self.logger.debug(
-                "asr_audio_sent",
-                samples=len(audio_chunk.data),
-                duration_seconds=duration,
-                timestamp=audio_chunk.timestamp.isoformat()
+            duration_sec = len(audio) / 16000
+            logger.info(
+                "asr_request_sending",
+                audio_duration=round(duration_sec, 2),
+                prompt_length=len(prompt),
+                speaker_id=speaker_id,
             )
 
+            response = await self.http_client.post(self.url, json=request.model_dump())
+            response.raise_for_status()
+            asr_response = ASRResponse.model_validate(response.json())
+
+            total_words = sum(len(seg.words) for seg in asr_response.segments)
+            logger.info("asr_response_received", total_words=total_words)
+
+            return asr_response
+
+        except httpx.HTTPStatusError as e:
+            logger.error("asr_http_error", status_code=e.response.status_code, error=str(e))
+            return ASRResponse()
+        except httpx.ConnectError as e:
+            logger.error("asr_connect_error", error=str(e))
+            return ASRResponse()
         except Exception as e:
-            self.logger.error("asr_send_error", error=str(e))
-            self.is_connected = False
-            # Remove from pending
-            self._pending_segments.pop(audio_id, None)
+            logger.error("asr_request_error", error=str(e))
+            return ASRResponse()
 
     async def disconnect(self) -> None:
-        """Disconnect from ASR server"""
-        self._running = False
-
-        if self.websocket:
-            try:
-                await self.websocket.close()
-                self.logger.info("asr_disconnected")
-            except Exception as e:
-                self.logger.error("asr_disconnect_error", error=str(e))
-
-        self.is_connected = False
-        self.websocket = None
-        self._pending_segments.clear()
+        """Close the HTTP client session."""
+        if self.http_client:
+            await self.http_client.aclose()
+            self.http_client = None
+            logger.info("asr_client_disconnected")

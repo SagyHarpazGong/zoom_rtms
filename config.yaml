@@ -8,20 +8,24 @@ webhook:
   port: 8080
   path: "/webhook"
 
-# VAD Server Configuration
+# VAD Configuration (local inference)
 vad:
-  ws_url: "ws://localhost:8001/vad"
-  packet_duration_ms: 100  # 0.1 seconds
-  reconnect_attempts: 5
-  reconnect_delay_seconds: 2
+  packet_duration_ms: 100       # 0.1 seconds per VAD packet
+  threshold: 0.5                # Speech detection threshold
+  model_path: ""                # Path to VAD model (placeholder)
 
-# ASR Server Configuration
+# ASR Configuration (KServe HTTP)
 asr:
-  ws_url: "ws://localhost:8002/asr"
-  segment_duration_seconds: 2.5
-  reconnect_attempts: 5
-  reconnect_delay_seconds: 2
-  enable_diarization: true
+  url: "http://localhost:8080/v2/models/whisper/infer"  # KServe endpoint
+  timeout_seconds: 30           # HTTP request timeout
+
+# Speech Processor Configuration
+speech_processor:
+  stride_seconds: 5.0           # ASR inference interval
+  silence_timeout_seconds: 1.0  # Silence to trigger speech end
+  max_audio_seconds: 30.0       # Whisper max input (30s)
+  pre_speech_buffer_seconds: 1.0  # Left-margin context
+  history_size: 30              # Recognized sentences to keep for context
 
 # Audio Configuration
 audio:
@@ -30,16 +34,9 @@ audio:
   bit_depth: 16
   encoding: "pcm"
   # Audio stream mode:
-  # - "mixed": All speakers mixed into one stream (Option 1) - ASR does diarization
-  # - "individual": Separate stream per speaker (Option 2) - Pre-separated speakers
+  # - "mixed": All speakers mixed into one stream - single SpeechProcessor
+  # - "individual": Separate stream per speaker - one SpeechProcessor per speaker
   stream_mode: "mixed"  # Options: "mixed", "individual"
-
-# Buffering Configuration
-buffering:
-  vad_buffer_size_ms: 100
-  speech_buffer_size_seconds: 5.0  # Max buffer before forcing ASR
-  silence_timeout_seconds: 1.0  # Silence duration to trigger ASR
-  min_speech_duration_ms: 500  # Minimum speech duration to process
 
 # Recording Configuration
 recording:

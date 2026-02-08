@@ -4,12 +4,12 @@ import asyncio
 import argparse
 import signal
 import sys
-import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from datetime import datetime
 
 import yaml
+import numpy as np
 import rtms
 
 from src.utils import setup_logging, get_logger, pcm_to_numpy
@@ -17,6 +17,7 @@ from src.rtms_client import RTMSClient, RTMSWebhookHandler
 from src.vad_client import VADClient
 from src.asr_client import ASRClient
 from src.audio_buffer import AudioBuffer, AudioChunk
+from src.speech_processor import SpeechProcessor, SharedConversationContext
 from src.transcription_handler import TranscriptionHandler
 from src.recorder import AudioRecorder
 
@@ -28,9 +29,14 @@ class RTMSTranscriptionSystem:
         self.config = config
         self.logger = get_logger(__name__)
 
+        # Stream mode
+        self.stream_mode = config['audio'].get('stream_mode', 'mixed')
+        self.per_speaker_processing = (self.stream_mode == 'individual')
+
         # Initialize components
         self._init_clients()
         self._init_audio_buffer()
+        self._init_speech_processors()
         self._init_transcription_handler()
         self._init_recorder()
 
@@ -40,59 +46,71 @@ class RTMSTranscriptionSystem:
 
     def _init_clients(self) -> None:
         """Initialize clients"""
-        # Get stream mode from config
-        stream_mode = self.config['audio'].get('stream_mode', 'mixed')
-
         # Zoom RTMS client
         self.rtms_client = RTMSClient(
             client_id=self.config['zoom']['client_id'],
             client_secret=self.config['zoom']['client_secret'],
             sample_rate=self.config['audio']['sample_rate'],
             channels=self.config['audio']['channels'],
-            stream_mode=stream_mode
+            stream_mode=self.stream_mode
         )
 
-        # VAD client
+        # VAD client (local inference)
         self.vad_client = VADClient(
-            ws_url=self.config['vad']['ws_url'],
-            reconnect_attempts=self.config['vad']['reconnect_attempts'],
-            reconnect_delay=self.config['vad']['reconnect_delay_seconds']
+            threshold=self.config['vad']['threshold'],
+            model_path=self.config['vad'].get('model_path', ''),
         )
 
-        # ASR client
+        # ASR client (HTTP)
         self.asr_client = ASRClient(
-            ws_url=self.config['asr']['ws_url'],
-            enable_diarization=self.config['asr']['enable_diarization'],
-            reconnect_attempts=self.config['asr']['reconnect_attempts'],
-            reconnect_delay=self.config['asr']['reconnect_delay_seconds']
+            url=self.config['asr']['url'],
+            timeout_seconds=self.config['asr']['timeout_seconds'],
         )
 
-        self.logger.info("clients_initialized", stream_mode=stream_mode)
+        self.logger.info("clients_initialized", stream_mode=self.stream_mode)
 
     def _init_audio_buffer(self) -> None:
-        """Initialize audio buffer manager"""
-        # Determine processing mode from config
-        stream_mode = self.config['audio'].get('stream_mode', 'mixed')
-        per_speaker_processing = (stream_mode == 'individual')
-
+        """Initialize audio buffer manager (VAD packet creation only)"""
         self.audio_buffer = AudioBuffer(
             sample_rate=self.config['audio']['sample_rate'],
             vad_duration_ms=self.config['vad']['packet_duration_ms'],
-            asr_duration_seconds=self.config['asr']['segment_duration_seconds'],
-            min_speech_duration_ms=self.config['buffering']['min_speech_duration_ms'],
-            silence_timeout_seconds=self.config['buffering']['silence_timeout_seconds'],
-            per_speaker_processing=per_speaker_processing
+            per_speaker_processing=self.per_speaker_processing,
         )
 
-        # Set callbacks
+        # Set callback for VAD packets
         self.audio_buffer.set_vad_callback(self._on_vad_packet_ready)
-        self.audio_buffer.set_asr_callback(self._on_asr_segment_ready)
 
         self.logger.info(
             "audio_buffer_initialized",
-            stream_mode=stream_mode,
-            per_speaker_processing=per_speaker_processing
+            stream_mode=self.stream_mode,
+            per_speaker_processing=self.per_speaker_processing,
         )
+
+    def _init_speech_processors(self) -> None:
+        """Initialize shared conversation context and speech processors"""
+        sp_config = self.config['speech_processor']
+
+        # Shared conversation context — one per meeting, shared across all speakers.
+        # Holds recog_sent_history and all committed words from all speakers.
+        self.shared_context = SharedConversationContext(
+            history_size=sp_config.get('history_size', 30),
+        )
+
+        self.speech_processors: Dict[str, SpeechProcessor] = {}
+
+        if not self.per_speaker_processing:
+            # Mixed mode: one shared processor
+            self.speech_processors['__mixed__'] = SpeechProcessor(
+                asr_client=self.asr_client,
+                shared_context=self.shared_context,
+                speaker_id=None,
+                stride_sec=sp_config['stride_seconds'],
+                silence_timeout_sec=sp_config['silence_timeout_seconds'],
+                pre_speech_buffer_sec=sp_config.get('pre_speech_buffer_seconds', 1.0),
+            )
+        # Individual mode: processors created on-demand per speaker
+
+        self.logger.info("speech_processors_initialized", mode=self.stream_mode)
 
     def _init_transcription_handler(self) -> None:
         """Initialize transcription handler"""
@@ -127,6 +145,33 @@ class RTMSTranscriptionSystem:
 
         self.logger.info("recorder_initialized")
 
+    def _get_speech_processor(self, speaker_id: Optional[str]) -> SpeechProcessor:
+        """Get or create SpeechProcessor for a speaker.
+
+        Args:
+            speaker_id: Speaker identifier (None for mixed mode).
+
+        Returns:
+            SpeechProcessor for the given speaker.
+        """
+        if not self.per_speaker_processing:
+            return self.speech_processors['__mixed__']
+
+        key = speaker_id or 'unknown'
+        if key not in self.speech_processors:
+            sp_config = self.config['speech_processor']
+            self.speech_processors[key] = SpeechProcessor(
+                asr_client=self.asr_client,
+                shared_context=self.shared_context,
+                speaker_id=key,
+                stride_sec=sp_config['stride_seconds'],
+                silence_timeout_sec=sp_config['silence_timeout_seconds'],
+                pre_speech_buffer_sec=sp_config.get('pre_speech_buffer_seconds', 1.0),
+            )
+            self.logger.info("speech_processor_created", speaker_id=key)
+
+        return self.speech_processors[key]
+
     async def start(
         self,
         meeting_uuid: str,
@@ -148,7 +193,7 @@ class RTMSTranscriptionSystem:
         self.logger.info("system_starting", meeting_uuid=meeting_uuid)
 
         try:
-            # Connect to VAD and ASR services
+            # Connect to services
             await self._connect_services()
 
             # Set up callbacks
@@ -167,12 +212,9 @@ class RTMSTranscriptionSystem:
 
             self.logger.info("system_started", meeting_uuid=meeting_uuid)
 
-            # Main event loop - mix polling and async
+            # Main event loop
             while self.is_running:
-                # Poll RTMS client (synchronous)
                 self.rtms_client.poll()
-
-                # Small sleep to prevent busy loop
                 await asyncio.sleep(0.01)
 
         except Exception as e:
@@ -183,7 +225,6 @@ class RTMSTranscriptionSystem:
 
     async def _connect_services(self) -> None:
         """Connect to VAD and ASR services"""
-        # Connect concurrently
         results = await asyncio.gather(
             self.vad_client.connect(),
             self.asr_client.connect(),
@@ -199,12 +240,6 @@ class RTMSTranscriptionSystem:
         """Setup callbacks between components"""
         # RTMS -> Audio Buffer
         self.rtms_client.set_audio_callback(self._on_rtms_audio)
-
-        # VAD -> Audio Buffer
-        self.vad_client.set_result_callback(self._on_vad_result)
-
-        # ASR -> Transcription Handler
-        self.asr_client.set_transcription_callback(self._on_transcription_result)
 
         # RTMS participant events
         self.rtms_client.set_participant_joined_callback(self._on_participant_joined)
@@ -222,8 +257,7 @@ class RTMSTranscriptionSystem:
             participant_id: Participant identifier
             timestamp: Audio timestamp
         """
-        # Add to audio buffer (will trigger VAD processing)
-        # Pass participant_id for per-speaker processing mode
+        # Add to audio buffer (will trigger VAD packet creation)
         await self.audio_buffer.add_audio(audio_data, timestamp, speaker_id=participant_id)
 
         # Record audio if enabled
@@ -232,55 +266,37 @@ class RTMSTranscriptionSystem:
             self.recorder.add_audio(audio_array, participant_id)
 
     async def _on_vad_packet_ready(self, audio_chunk: AudioChunk) -> None:
-        """Handle VAD packet ready (0.1s)
+        """Handle VAD packet ready (0.1s): run VAD, forward to SpeechProcessor.
 
         Args:
-            audio_chunk: Audio chunk for VAD processing
+            audio_chunk: Audio chunk for VAD processing.
         """
-        # Send to VAD client
-        await self.vad_client.process_audio(audio_chunk)
+        # 1. Run local VAD
+        vad_result = self.vad_client.process_audio(audio_chunk)
 
-    async def _on_vad_result(self, is_speech: bool, audio_chunk: AudioChunk) -> None:
-        """Handle VAD result
+        # 2. Get or create SpeechProcessor for this speaker
+        processor = self._get_speech_processor(audio_chunk.speaker_id)
 
-        Args:
-            is_speech: Whether speech was detected
-            audio_chunk: The audio chunk that was analyzed
-        """
-        # Forward to audio buffer for speech accumulation
-        await self.audio_buffer.on_vad_result(is_speech, audio_chunk)
+        # 3. Convert int16 PCM to float32 for SpeechProcessor
+        audio_float32 = audio_chunk.data.astype(np.float32) / 32768.0
 
-    async def _on_asr_segment_ready(self, audio_chunk: AudioChunk) -> None:
-        """Handle ASR segment ready (2.5s)
-
-        Args:
-            audio_chunk: Audio chunk for ASR processing
-        """
-        # Send to ASR client
-        await self.asr_client.transcribe(audio_chunk)
-
-    async def _on_transcription_result(
-        self,
-        transcription: Dict[str, Any],
-        audio_chunk: Optional[AudioChunk]
-    ) -> None:
-        """Handle transcription result from ASR
-
-        Args:
-            transcription: Transcription result
-            audio_chunk: Associated audio chunk
-        """
-        text = transcription.get("text", "")
-        speaker_id = transcription.get("speaker_id")
-        confidence = transcription.get("confidence")
-
-        # Add to transcription handler
-        self.transcription_handler.add_transcription(
-            text=text,
-            speaker_id=speaker_id,
-            confidence=confidence,
-            timestamp=audio_chunk.timestamp if audio_chunk else None
+        # 4. Forward VAD result + audio to SpeechProcessor
+        timestamp = audio_chunk.timestamp.timestamp()  # datetime -> float seconds
+        newly_committed = await processor.on_vad_result(
+            is_speech=vad_result.is_speech,
+            audio_float32=audio_float32,
+            timestamp=timestamp,
         )
+
+        # 5. Forward committed words to TranscriptionHandler
+        for start_time, end_time, text in newly_committed:
+            self.transcription_handler.add_transcription(
+                text=text,
+                speaker_id=audio_chunk.speaker_id,
+                timestamp=audio_chunk.timestamp,
+                start_time=start_time,
+                end_time=end_time,
+            )
 
     def _on_participant_joined(self, participant_id: str, event: Dict[str, Any]) -> None:
         """Handle participant joined event
@@ -291,7 +307,6 @@ class RTMSTranscriptionSystem:
         """
         participant_name = event.get('participant_name')
 
-        # Update speaker names
         if participant_name:
             self.transcription_handler.update_speaker_name(
                 participant_id,
@@ -304,10 +319,22 @@ class RTMSTranscriptionSystem:
 
         self.logger.info("system_stopping")
 
+        # Flush all speech processors
+        for processor in self.speech_processors.values():
+            committed = await processor.flush()
+            for start_time, end_time, text in committed:
+                self.transcription_handler.add_transcription(
+                    text=text,
+                    speaker_id=processor.speaker_id,
+                    timestamp=datetime.utcnow(),
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+
         # Flush audio buffer
         await self.audio_buffer.flush()
 
-        # Disconnect VAD and ASR clients
+        # Disconnect clients
         await asyncio.gather(
             self.vad_client.disconnect(),
             self.asr_client.disconnect(),
@@ -355,7 +382,6 @@ async def start_with_webhook(config: Dict[str, Any]):
     logger = get_logger(__name__)
     logger.info("starting_webhook_mode")
 
-    # Get stream mode from config
     stream_mode = config['audio'].get('stream_mode', 'mixed')
 
     # Create webhook handler
@@ -376,14 +402,12 @@ async def start_with_webhook(config: Dict[str, Any]):
 
         logger.info("meeting_started_webhook", rtms_stream_id=rtms_stream_id)
 
-        # Create transcription system
         system = RTMSTranscriptionSystem(config)
-        system.rtms_client = client  # Use the webhook's client
+        system.rtms_client = client
 
         # Setup callbacks
         system._setup_callbacks()
 
-        # Start transcription
         if system.recorder:
             system.recorder.start_recording(rtms_stream_id)
 
@@ -392,7 +416,7 @@ async def start_with_webhook(config: Dict[str, Any]):
 
         systems[rtms_stream_id] = system
 
-        # Start VAD/ASR connections
+        # Connect services
         asyncio.create_task(system._connect_services())
 
     def on_meeting_ended(rtms_stream_id: str, payload: Dict[str, Any]):
@@ -416,10 +440,7 @@ async def start_with_webhook(config: Dict[str, Any]):
     # Keep running
     try:
         while True:
-            # Poll all active clients
             webhook_handler.poll_all()
-
-            # Small sleep
             await asyncio.sleep(0.01)
 
     except KeyboardInterrupt:
@@ -439,10 +460,7 @@ async def start_direct(
     logger = get_logger(__name__)
     logger.info("starting_direct_mode", meeting_uuid=meeting_uuid)
 
-    # Create system
     system = RTMSTranscriptionSystem(config)
-
-    # Start system
     await system.start(meeting_uuid, rtms_stream_id, server_urls)
 
 
