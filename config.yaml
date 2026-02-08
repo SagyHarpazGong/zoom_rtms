@@ -1,0 +1,66 @@
+# Zoom RTMS Configuration
+zoom:
+  client_id: "your_zoom_client_id"
+  client_secret: "your_zoom_client_secret"
+
+# Webhook Configuration (for automatic meeting join)
+webhook:
+  port: 8080
+  path: "/webhook"
+
+# VAD Server Configuration
+vad:
+  ws_url: "ws://localhost:8001/vad"
+  packet_duration_ms: 100  # 0.1 seconds
+  reconnect_attempts: 5
+  reconnect_delay_seconds: 2
+
+# ASR Server Configuration
+asr:
+  ws_url: "ws://localhost:8002/asr"
+  segment_duration_seconds: 2.5
+  reconnect_attempts: 5
+  reconnect_delay_seconds: 2
+  enable_diarization: true
+
+# Audio Configuration
+audio:
+  sample_rate: 16000  # Hz
+  channels: 1  # Mono
+  bit_depth: 16
+  encoding: "pcm"
+
+# Buffering Configuration
+buffering:
+  vad_buffer_size_ms: 100
+  speech_buffer_size_seconds: 5.0  # Max buffer before forcing ASR
+  silence_timeout_seconds: 1.0  # Silence duration to trigger ASR
+  min_speech_duration_ms: 500  # Minimum speech duration to process
+
+# Recording Configuration
+recording:
+  enabled: true
+  output_dir: "./recordings"
+  save_audio: true
+  save_transcripts: true
+  audio_format: "wav"
+
+# Transcription Configuration
+transcription:
+  output_format: "json"  # json, text, srt
+  enable_timestamps: true
+  enable_speaker_labels: true
+  real_time_output: true
+
+# Logging Configuration
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "structured"  # structured, simple
+  output: "console"  # console, file, both
+  log_file: "./logs/zoom_rtms.log"
+
+# Performance Configuration
+performance:
+  max_concurrent_speakers: 10
+  audio_chunk_queue_size: 1000
+  transcription_queue_size: 100
