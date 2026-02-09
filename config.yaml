@@ -38,6 +38,12 @@ audio:
   # - "individual": Separate stream per speaker - one SpeechProcessor per speaker
   stream_mode: "mixed"  # Options: "mixed", "individual"
 
+# ASR Mode Configuration
+# Choose between custom ASR pipeline or RTMS built-in transcription
+asr_mode: "custom"  # Options: "custom", "rtms"
+# - "custom": Use local VAD + HTTP ASR + LCP pipeline (full control, requires ASR server)
+# - "rtms": Use RTMS built-in transcription (simpler, no ASR server needed, no LCP)
+
 # Recording Configuration
 recording:
   enabled: true

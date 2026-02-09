@@ -29,7 +29,8 @@ class RTMSTranscriptionSystem:
         self.config = config
         self.logger = get_logger(__name__)
 
-        # Stream mode
+        # ASR mode and stream mode
+        self.asr_mode = config.get('asr_mode', 'custom')  # 'custom' or 'rtms'
         self.stream_mode = config['audio'].get('stream_mode', 'mixed')
         self.per_speaker_processing = (self.stream_mode == 'individual')
 
@@ -45,8 +46,8 @@ class RTMSTranscriptionSystem:
         self.meeting_id: Optional[str] = None
 
     def _init_clients(self) -> None:
-        """Initialize clients"""
-        # Zoom RTMS client
+        """Initialize clients based on ASR mode"""
+        # Zoom RTMS client (always needed)
         self.rtms_client = RTMSClient(
             client_id=self.config['zoom']['client_id'],
             client_secret=self.config['zoom']['client_secret'],
@@ -55,62 +56,75 @@ class RTMSTranscriptionSystem:
             stream_mode=self.stream_mode
         )
 
-        # VAD client (local inference)
-        self.vad_client = VADClient(
-            threshold=self.config['vad']['threshold'],
-            model_path=self.config['vad'].get('model_path', ''),
-        )
+        if self.asr_mode == 'custom':
+            # Custom ASR pipeline: VAD + ASR + LCP
+            self.vad_client = VADClient(
+                threshold=self.config['vad']['threshold'],
+                model_path=self.config['vad'].get('model_path', ''),
+            )
 
-        # ASR client (HTTP)
-        self.asr_client = ASRClient(
-            url=self.config['asr']['url'],
-            timeout_seconds=self.config['asr']['timeout_seconds'],
-        )
+            self.asr_client = ASRClient(
+                url=self.config['asr']['url'],
+                timeout_seconds=self.config['asr']['timeout_seconds'],
+            )
+        else:
+            # RTMS mode: use built-in transcription
+            self.vad_client = None
+            self.asr_client = None
 
-        self.logger.info("clients_initialized", stream_mode=self.stream_mode)
+        self.logger.info("clients_initialized", asr_mode=self.asr_mode, stream_mode=self.stream_mode)
 
     def _init_audio_buffer(self) -> None:
-        """Initialize audio buffer manager (VAD packet creation only)"""
-        self.audio_buffer = AudioBuffer(
-            sample_rate=self.config['audio']['sample_rate'],
-            vad_duration_ms=self.config['vad']['packet_duration_ms'],
-            per_speaker_processing=self.per_speaker_processing,
-        )
+        """Initialize audio buffer manager (only for custom ASR mode)"""
+        if self.asr_mode == 'custom':
+            self.audio_buffer = AudioBuffer(
+                sample_rate=self.config['audio']['sample_rate'],
+                vad_duration_ms=self.config['vad']['packet_duration_ms'],
+                per_speaker_processing=self.per_speaker_processing,
+            )
 
-        # Set callback for VAD packets
-        self.audio_buffer.set_vad_callback(self._on_vad_packet_ready)
+            # Set callback for VAD packets
+            self.audio_buffer.set_vad_callback(self._on_vad_packet_ready)
 
-        self.logger.info(
-            "audio_buffer_initialized",
-            stream_mode=self.stream_mode,
-            per_speaker_processing=self.per_speaker_processing,
-        )
+            self.logger.info(
+                "audio_buffer_initialized",
+                stream_mode=self.stream_mode,
+                per_speaker_processing=self.per_speaker_processing,
+            )
+        else:
+            self.audio_buffer = None
+            self.logger.info("audio_buffer_skipped", asr_mode=self.asr_mode)
 
     def _init_speech_processors(self) -> None:
-        """Initialize shared conversation context and speech processors"""
-        sp_config = self.config['speech_processor']
+        """Initialize shared conversation context and speech processors (only for custom ASR mode)"""
+        if self.asr_mode == 'custom':
+            sp_config = self.config['speech_processor']
 
-        # Shared conversation context — one per meeting, shared across all speakers.
-        # Holds recog_sent_history and all committed words from all speakers.
-        self.shared_context = SharedConversationContext(
-            history_size=sp_config.get('history_size', 30),
-        )
-
-        self.speech_processors: Dict[str, SpeechProcessor] = {}
-
-        if not self.per_speaker_processing:
-            # Mixed mode: one shared processor
-            self.speech_processors['__mixed__'] = SpeechProcessor(
-                asr_client=self.asr_client,
-                shared_context=self.shared_context,
-                speaker_id=None,
-                stride_sec=sp_config['stride_seconds'],
-                silence_timeout_sec=sp_config['silence_timeout_seconds'],
-                pre_speech_buffer_sec=sp_config.get('pre_speech_buffer_seconds', 1.0),
+            # Shared conversation context — one per meeting, shared across all speakers.
+            # Holds recog_sent_history and all committed words from all speakers.
+            self.shared_context = SharedConversationContext(
+                history_size=sp_config.get('history_size', 30),
             )
-        # Individual mode: processors created on-demand per speaker
 
-        self.logger.info("speech_processors_initialized", mode=self.stream_mode)
+            self.speech_processors: Dict[str, SpeechProcessor] = {}
+
+            if not self.per_speaker_processing:
+                # Mixed mode: one shared processor
+                self.speech_processors['__mixed__'] = SpeechProcessor(
+                    asr_client=self.asr_client,
+                    shared_context=self.shared_context,
+                    speaker_id=None,
+                    stride_sec=sp_config['stride_seconds'],
+                    silence_timeout_sec=sp_config['silence_timeout_seconds'],
+                    pre_speech_buffer_sec=sp_config.get('pre_speech_buffer_seconds', 1.0),
+                )
+            # Individual mode: processors created on-demand per speaker
+
+            self.logger.info("speech_processors_initialized", mode=self.stream_mode)
+        else:
+            self.shared_context = None
+            self.speech_processors = {}
+            self.logger.info("speech_processors_skipped", asr_mode=self.asr_mode)
 
     def _init_transcription_handler(self) -> None:
         """Initialize transcription handler"""
@@ -224,24 +238,31 @@ class RTMSTranscriptionSystem:
             await self.stop()
 
     async def _connect_services(self) -> None:
-        """Connect to VAD and ASR services"""
-        results = await asyncio.gather(
-            self.vad_client.connect(),
-            self.asr_client.connect(),
-            return_exceptions=True
-        )
+        """Connect to VAD and ASR services (only for custom ASR mode)"""
+        if self.asr_mode == 'custom':
+            results = await asyncio.gather(
+                self.vad_client.connect(),
+                self.asr_client.connect(),
+                return_exceptions=True
+            )
 
-        if not all(results):
-            raise RuntimeError("Failed to connect to VAD or ASR services")
+            if not all(results):
+                raise RuntimeError("Failed to connect to VAD or ASR services")
 
-        self.logger.info("services_connected")
+            self.logger.info("services_connected")
+        else:
+            self.logger.info("services_skipped", asr_mode=self.asr_mode)
 
     def _setup_callbacks(self) -> None:
-        """Setup callbacks between components"""
-        # RTMS -> Audio Buffer
-        self.rtms_client.set_audio_callback(self._on_rtms_audio)
+        """Setup callbacks between components based on ASR mode"""
+        if self.asr_mode == 'custom':
+            # Custom mode: RTMS audio → Audio Buffer → VAD → SpeechProcessor
+            self.rtms_client.set_audio_callback(self._on_rtms_audio)
+        else:
+            # RTMS mode: RTMS transcription → Transcription Handler directly
+            self.rtms_client.set_transcription_callback(self._on_rtms_transcription)
 
-        # RTMS participant events
+        # RTMS participant events (always needed)
         self.rtms_client.set_participant_joined_callback(self._on_participant_joined)
 
     async def _on_rtms_audio(
@@ -298,6 +319,34 @@ class RTMSTranscriptionSystem:
                 end_time=end_time,
             )
 
+    async def _on_rtms_transcription(
+        self,
+        transcription: Dict[str, Any],
+        participant_id: str,
+        timestamp: datetime
+    ) -> None:
+        """Handle transcription from RTMS (RTMS mode only).
+
+        Args:
+            transcription: Transcription result from RTMS
+            participant_id: Participant identifier
+            timestamp: Transcription timestamp
+        """
+        text = transcription.get('text', '')
+        confidence = transcription.get('confidence')
+        start_time = transcription.get('start_time')
+        end_time = transcription.get('end_time')
+
+        if text:
+            self.transcription_handler.add_transcription(
+                text=text,
+                speaker_id=participant_id,
+                timestamp=timestamp,
+                confidence=confidence,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
     def _on_participant_joined(self, participant_id: str, event: Dict[str, Any]) -> None:
         """Handle participant joined event
 
@@ -319,27 +368,30 @@ class RTMSTranscriptionSystem:
 
         self.logger.info("system_stopping")
 
-        # Flush all speech processors
-        for processor in self.speech_processors.values():
-            committed = await processor.flush()
-            for start_time, end_time, text in committed:
-                self.transcription_handler.add_transcription(
-                    text=text,
-                    speaker_id=processor.speaker_id,
-                    timestamp=datetime.utcnow(),
-                    start_time=start_time,
-                    end_time=end_time,
-                )
+        # Flush speech processors (custom mode only)
+        if self.asr_mode == 'custom' and self.speech_processors:
+            for processor in self.speech_processors.values():
+                committed = await processor.flush()
+                for start_time, end_time, text in committed:
+                    self.transcription_handler.add_transcription(
+                        text=text,
+                        speaker_id=processor.speaker_id,
+                        timestamp=datetime.utcnow(),
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
 
-        # Flush audio buffer
-        await self.audio_buffer.flush()
+        # Flush audio buffer (custom mode only)
+        if self.audio_buffer:
+            await self.audio_buffer.flush()
 
-        # Disconnect clients
-        await asyncio.gather(
-            self.vad_client.disconnect(),
-            self.asr_client.disconnect(),
-            return_exceptions=True
-        )
+        # Disconnect clients (custom mode only)
+        if self.asr_mode == 'custom':
+            await asyncio.gather(
+                self.vad_client.disconnect(),
+                self.asr_client.disconnect(),
+                return_exceptions=True
+            )
 
         # Leave RTMS meeting
         self.rtms_client.leave()

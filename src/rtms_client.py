@@ -34,6 +34,7 @@ class RTMSClient:
 
         # Callbacks
         self.audio_callback: Optional[Callable] = None
+        self.transcription_callback: Optional[Callable] = None
         self.participant_joined_callback: Optional[Callable] = None
         self.participant_left_callback: Optional[Callable] = None
         self.session_update_callback: Optional[Callable] = None
@@ -54,6 +55,13 @@ class RTMSClient:
         Callback signature: async def callback(audio_data: bytes, participant_id: str, timestamp: datetime)
         """
         self.audio_callback = callback
+
+    def set_transcription_callback(self, callback: Callable) -> None:
+        """Set callback for incoming transcription data
+
+        Callback signature: async def callback(transcription: Dict[str, Any], participant_id: str, timestamp: datetime)
+        """
+        self.transcription_callback = callback
 
     def set_participant_joined_callback(self, callback: Callable) -> None:
         """Set callback for participant joined events"""
@@ -267,6 +275,44 @@ class RTMSClient:
 
             except Exception as e:
                 self.logger.error("audio_callback_error", error=str(e))
+
+        @self.client.onTranscription
+        def on_transcription(transcription_data, metadata):
+            """Called when transcription data is received
+
+            Args:
+                transcription_data: Transcription result data
+                metadata: Metadata including participant info and timing
+            """
+            try:
+                # Get participant information
+                participant_id = getattr(metadata, 'participant_id', 'unknown')
+
+                # Convert timestamp to datetime
+                transcription_timestamp = datetime.utcnow()
+
+                self.logger.debug(
+                    "rtms_transcription_received",
+                    participant_id=participant_id,
+                    text_length=len(str(transcription_data.get('text', '')))
+                )
+
+                # Forward to transcription callback
+                if self.transcription_callback:
+                    import asyncio
+                    # Run async callback in event loop
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.create_task(
+                            self.transcription_callback(transcription_data, participant_id, transcription_timestamp)
+                        )
+                    else:
+                        loop.run_until_complete(
+                            self.transcription_callback(transcription_data, participant_id, transcription_timestamp)
+                        )
+
+            except Exception as e:
+                self.logger.error("transcription_callback_error", error=str(e))
 
         @self.client.onLeave
         def on_leave(reason):
